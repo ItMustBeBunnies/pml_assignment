@@ -1,0 +1,164 @@
+---
+title: Using wearable-sensor data to predict how well a weight lifting exercise was performed
+
+---
+
+##Synopsis
+The aim of this study was to predict how well a weight lifting exercise,
+specifically the Unilateral Dumbbell Biceps Curl, was carried out. After initial data
+cleaning, a random forest model was built using caret and its performance estimated from
+out-of-bag error rate and validated on data held back from training.
+
+##Introduction
+The response, *classe*, is a categorical variable with five levels;
+A, B, C, D, and E, denoting exactly according to specification (A), throwing the
+elbows to the front (B), lifting the dumbbell only halfway (C), lowering the
+dumbbell only halfway (D), and throwing the hips to the front (E). Thus class
+A is the correct, prescribed execution of the exercise, and the other four classes
+are common mistakes. The data, and the original study, comes from Velloso et al. [Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013] available [here](http://groupware.les.inf.puc-rio.br/har).
+
+##Analysis
+```{r, initialize}
+require(caret)
+require(randomForest)
+set.seed(2015)
+```
+
+```{r, readdata}
+data.training <- read.csv("pml-training.csv")
+print(dim(data.training))
+```
+The training data set comprises `r nrow(data.training)` observations of `r ncol(data.training)` variables,
+so is a substantial size, and importantly contains many variables
+with no value (NA), both factors have implications for building predictive models.
+
+There are two distinct groups of numbers of NA: 0 and 19216; observations
+either have 0 NA values or 19216. 
+```{r}
+table(apply(data.training, 2, function(x) sum(is.na(x))))
+```
+so 93 of the 160 columns have zero NAs, but 67 have 19216 NAs.
+Looking at it another way,
+```{r}
+table(apply(data.training, 1, function(x) sum(is.na(x))))
+```
+the NAs are distributed over the same number of columns in each
+observation with missing values, implying a pattern.
+This is summarized by:
+```{r}
+addmargins(table(apply(data.training, 1, function(x) sum(is.na(x))), data.training$classe))
+```
+So a row either has zero NAs or 67, and the NAs occur in 19216 observations
+out of 19622, spread quite evenly across the classes.
+
+The data columns include indexes, and usernames etc. which should not be included in a 
+predictive model (in this context) because we wish to make predictions based on data
+received from sensors.
+
+The NAs are seen to occur in the same columns each time, and these appear to be associated with the calculation of summary statistics:
+```{r, summarystatNA}
+na.cols <- apply(data.training, 2, function(x) sum(is.na(x))) > 0
+#Variables with missing values have names that start:
+table(unlist(
+        lapply(
+            strsplit(
+                names(data.training[, na.cols]), "_"
+                    ), function(x) x[1]
+              )
+            )
+     )
+```
+
+As it would seem that the missing values arise from some summary statistics
+not being calculated for some 98% of the observations, spread very evenly over all
+classes. Our first approach, therefore, is to delete these columns.
+```{r, cropdata}
+#remove first columns that are only index, username, timestamp etc.
+data.training <- data.training[, 8:160]
+na.cols <- na.cols[8:160]
+keep.colnames <- names(data.training[, !na.cols])
+data.training <- data.training[, keep.colnames]
+#data.training now comprises only columns containing no NAs
+```
+
+Plotting pairs of covariates,
+```{r, pairsplot}
+ncols <- ncol(data.training) #response column
+pairs(data.training[seq(1, 19622, 50), c(41:50, ncols)]) #for example
+```
+
+suggests there are variables that have little variability, specifically
+a large population clusters around one value, with only a few having a
+noticeably different value. These covariates (with near zero variance)
+can be removed thus:
+```{r, removeNZV}
+near.stationary.inds <- nearZeroVar(data.training)
+#Variable names being dropped:
+print(names(data.training)[near.stationary.inds])
+data.training <- data.training[, -near.stationary.inds]
+#don't worry, classe (response) is still in here
+```
+
+```{r, confirmRemainingCovariates}
+#variable names remaining:
+names(data.training)
+```
+
+##Predictive model
+Having now removed columns associated with housekeeping, columns containing 98% NAs,
+and columns of near zero variance, we then partition the training data into a set used
+for model building and a set left aside that is then only used to assess/confirm model
+performance.
+
+```{r, modelBuilding}
+inTrain <- createDataPartition(y=data.training$classe, p=0.6, list=FALSE)
+
+training <- data.training[inTrain, ]
+testing <- data.training[-inTrain, ]
+
+require(doMC)
+registerDoMC(cores = 7)
+
+modelCacheFile <- "modfit.rds"
+if (file.exists(modelCacheFile)) {
+    modfit <- readRDS(modelCacheFile)
+} else {
+    system.time(modfit <- train(classe ~ ., method="rf", data=training, verbose=FALSE))
+}
+```
+Having reduced the number of columns, and using 60% of the training data for model
+building, the memory requirements are now such that we could easily parallelize this
+step over 7 cores. This consumed around 80% of 8 GB RAM system memory and took
+some 15 minutes on an i7.
+
+Model parameters are:
+```{r, modfit}
+print(modfit)
+```
+A key question is what error rate we might expect from this model when we apply it to out-of-sample data,
+i.e. data not involved in the model training. For random forests, we can get this estimate from
+the out-of-bag estimate of error rate for the final model:
+```{r, finalModel}
+print(modfit$finalModel)
+```
+The confusion matrix looks good, and the out-of-bag estimate of error rate stands at just 0.8%.
+Ultimately, we wish to verify our performance estimate on the held back data:
+```{r, validation}
+#the 40% of data not previously used
+cm <- confusionMatrix(testing$classe, predict(modfit, testing))
+print(cm)
+#sum of off diagonals divided by total = error rate
+er <- (sum(cm$table)-sum(diag(cm$table))) / sum(cm$table)
+```
+The overall accuracy of 99.1% is impressive, and the class-specific accuracies 
+(A: 99.6%, B: 99.4%, C: 98.9%, D: 99.3%, and E: 99.9%) compare favourably
+with those obtained by Velloso et al. (A: 97.6%, B: 97.3%, C: 98.2%, D: 98.1%, and E: 99.1%, with
+weighted average of 98.2%). The error rate of `r sprintf("%.1f", 100*er)` on the testing set
+agrees with the out-of-bag estimate from the random forest model.
+
+##Summary
+A work flow was demonstrated from reading in data, cleaning the data and
+performing sensible, justifiable, feature selection, through to model building and obtaining an
+estimate of out of sample error rate subsequently confirmed on an independent data set (not used
+in model building). Prediction performance was very good, comparing favourably to that of the original
+authors.
